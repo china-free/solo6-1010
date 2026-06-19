@@ -8,9 +8,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from .changeset import ChangeItem, ChangeSet, ChangeSetCalculator, ChangeType
 from .hashing import md5_file, sha256_file
-from .scanner import FileScanner, ScanResult, ScannedFile
-from .storage import Storage
+from .scanner import FileScanner, ScanResult
+from .storage import FileRecord, Storage
 
 
 @dataclass
@@ -32,6 +33,7 @@ class BackupManager:
         self.backup_root = Path(backup_root)
         self.storage = Storage(self.backup_root)
         self.scanner = FileScanner(self.storage)
+        self.changeset_calc = ChangeSetCalculator()
 
     def init(self) -> bool:
         """初始化备份仓库"""
@@ -86,80 +88,38 @@ class BackupManager:
             scan_result: ScanResult = self.scanner.scan_source(
                 src.id, src.path, snapshot_id
             )
-            total_files += scan_result.total_files
-            total_size += scan_result.total_size
-            changed_files += scan_result.changed_files
-            deleted_count += scan_result.deleted_files
 
-            print(f"  📂 扫描 {src.path}: {scan_result.total_files} 个文件, "
-                  f"{scan_result.changed_files} 个变化"
-                  f"{f', {scan_result.deleted_files} 个删除' if scan_result.deleted_files else ''}")
+            changeset: ChangeSet = self.changeset_calc.calculate(
+                source_id=src.id,
+                source_path=src.path,
+                current_files=scan_result.current_files,
+                previous_records=scan_result.previous_records,
+            )
 
-            for sf in scan_result.files:
-                stored_path = ""
+            total_files += changeset.total_count
+            total_size += changeset.total_size
+            changed_files += changeset.changed_count
+            deleted_count += len(changeset.deleted)
 
-                if sf.is_deleted:
-                    self.storage.add_file(
-                        snapshot_id=snapshot_id,
-                        source_id=src.id,
-                        rel_path=sf.rel_path,
-                        abs_path=str(sf.abs_path) if sf.abs_path.exists() else sf.prev_record.abs_path,
-                        size=sf.size,
-                        mtime=sf.mtime,
-                        md5=sf.md5,
-                        sha256=sf.sha256,
-                        stored_path=sf.prev_record.stored_path if sf.prev_record else "",
-                        is_new=False,
-                        is_modified=False,
-                        is_deleted=True,
-                    )
-                    print(f"    🗑️  [删除] {sf.rel_path}")
-                    continue
+            self._print_changeset_summary(src.path, changeset)
 
-                if sf.is_new or sf.is_modified:
-                    try:
-                        sha256 = sha256_file(sf.abs_path)
-                        md5 = md5_file(sf.abs_path)
-                        sf.sha256 = sha256
-                        sf.md5 = md5
+            for item in changeset.all_items:
+                if item.change_type in (ChangeType.NEW, ChangeType.MODIFIED):
+                    self._store_changed_file(snapshot_id, src.id, item)
+                    if item.change_type == ChangeType.NEW:
+                        print(f"    ✅ [新增] {item.rel_path}")
+                    else:
+                        print(f"    ✅ [修改] {item.rel_path}")
+                    copied_files += 1
 
-                        dup = self.storage.find_file_by_sha256(sha256)
-                        if dup and (Path(self.storage.storage_dir / dup.stored_path)).exists():
-                            stored_path = dup.stored_path
-                            skipped_files += 1
-                            print(f"    📋 去重跳过 (SHA256相同): {sf.rel_path}")
-                        else:
-                            stored_path = self._hash_and_store(sf.abs_path, sha256, md5)
-                            copied_files += 1
-                            change_type = "新增" if sf.is_new else "修改"
-                            print(f"    ✅ [{change_type}] {sf.rel_path} "
-                                  f"({self._format_size(sf.size)})")
-                    except (OSError, PermissionError) as e:
-                        print(f"    ❌ 无法备份 {sf.rel_path}: {e}", file=sys.stderr)
-                        continue
-                else:
-                    if sf.prev_record:
-                        stored_path = sf.prev_record.stored_path
-                        sf.sha256 = sf.prev_record.sha256
-                        sf.md5 = sf.prev_record.md5
-                        skipped_files += 1
-                        print(f"    ⏭️  未变化: {sf.rel_path}")
+                elif item.change_type == ChangeType.UNCHANGED:
+                    self._record_unchanged_file(snapshot_id, src.id, item)
+                    print(f"    ⏭️  未变化: {item.rel_path}")
+                    skipped_files += 1
 
-                if stored_path:
-                    self.storage.add_file(
-                        snapshot_id=snapshot_id,
-                        source_id=src.id,
-                        rel_path=sf.rel_path,
-                        abs_path=str(sf.abs_path.resolve()),
-                        size=sf.size,
-                        mtime=sf.mtime,
-                        md5=sf.md5,
-                        sha256=sf.sha256,
-                        stored_path=stored_path,
-                        is_new=sf.is_new,
-                        is_modified=sf.is_modified,
-                        is_deleted=False,
-                    )
+                elif item.change_type == ChangeType.DELETED:
+                    self._record_deleted_file(snapshot_id, src.id, item)
+                    print(f"    🗑️  [删除] {item.rel_path}")
 
         self.storage.update_snapshot_stats(
             snapshot_id, total_files, total_size, changed_files
@@ -176,15 +136,106 @@ class BackupManager:
             deleted_files=deleted_count,
         )
 
-        print(f"\n🎉 快照 #{snapshot_id} 备份完成:")
-        print(f"   总文件数: {total_files}  ({self._format_size(total_size)})")
-        print(f"   变化文件: {changed_files}")
-        print(f"   实际拷贝: {copied_files}")
-        print(f"   去重跳过: {skipped_files}")
-        if deleted_count > 0:
-            print(f"   已删除:   {deleted_count}")
-        print(f"   时间: {datetime.fromtimestamp(result.created_at).strftime('%Y-%m-%d %H:%M:%S')}")
+        self._print_backup_summary(result)
         return result
+
+    def _print_changeset_summary(self, src_path: str, changeset: ChangeSet) -> None:
+        parts = [
+            f"{changeset.total_count} 个文件",
+            f"{changeset.changed_count} 个变化",
+        ]
+        if changeset.new:
+            parts.append(f"{len(changeset.new)} 个新增")
+        if changeset.modified:
+            parts.append(f"{len(changeset.modified)} 个修改")
+        if changeset.deleted:
+            parts.append(f"{len(changeset.deleted)} 个删除")
+        print(f"  📂 扫描 {src_path}: {', '.join(parts)}")
+
+    def _store_changed_file(self, snapshot_id: int, source_id: int, item: ChangeItem) -> None:
+        """统一的存储写入流程：新增或修改走这个流程"""
+        assert item.current is not None
+
+        try:
+            sha256 = sha256_file(item.current.abs_path)
+            md5 = md5_file(item.current.abs_path)
+            item.current.sha256 = sha256
+            item.current.md5 = md5
+            dup = self.storage.find_file_by_sha256(sha256)
+            if dup and (Path(self.storage.storage_dir / dup.stored_path)).exists():
+                stored_path = dup.stored_path
+                print(f"    📋 去重跳过 (SHA256相同): {item.rel_path}")
+            else:
+                stored_path = self._hash_and_store(item.current.abs_path, sha256, md5)
+
+        except (OSError, PermissionError) as e:
+            raise RuntimeError(f"无法备份 {item.rel_path}: {e}")
+
+        abs_path_str = str(item.current.abs_path.resolve()) if item.current.abs_path.exists() else item.current.abs_path
+
+        self.storage.add_file(
+            snapshot_id=snapshot_id,
+            source_id=source_id,
+            rel_path=item.rel_path,
+            abs_path=abs_path_str,
+            size=item.current.size,
+            mtime=item.current.mtime,
+            md5=md5,
+            sha256=sha256,
+            stored_path=stored_path,
+            is_new=(item.change_type == ChangeType.NEW),
+            is_modified=(item.change_type == ChangeType.MODIFIED),
+            is_deleted=False,
+        )
+
+    def _record_unchanged_file(self, snapshot_id: int, source_id: int, item: ChangeItem) -> None:
+        """记录未变化的文件，复用之前的存储路径"""
+        assert item.current is not None
+        assert item.previous is not None
+
+        self.storage.add_file(
+            snapshot_id=snapshot_id,
+            source_id=source_id,
+            rel_path=item.rel_path,
+            abs_path=str(item.current.abs_path.resolve()),
+            size=item.current.size,
+            mtime=item.current.mtime,
+            md5=item.current.md5,
+            sha256=item.current.sha256,
+            stored_path=item.previous.stored_path,
+            is_new=False,
+            is_modified=False,
+            is_deleted=False,
+        )
+
+    def _record_deleted_file(self, snapshot_id: int, source_id: int, item: ChangeItem) -> None:
+        """记录已删除的文件"""
+        assert item.previous is not None
+
+        self.storage.add_file(
+            snapshot_id=snapshot_id,
+            source_id=source_id,
+            rel_path=item.rel_path,
+            abs_path=item.previous.abs_path,
+            size=item.previous.size,
+            mtime=item.previous.mtime,
+            md5=item.previous.md5,
+            sha256=item.previous.sha256,
+            stored_path=item.previous.stored_path,
+            is_new=False,
+            is_modified=False,
+            is_deleted=True,
+        )
+
+    def _print_backup_summary(self, result: BackupResult) -> None:
+        print(f"\n🎉 快照 #{result.snapshot_id} 备份完成:")
+        print(f"   总文件数: {result.total_files}  ({self._format_size(result.total_size)})")
+        print(f"   变化文件: {result.changed_files}")
+        print(f"   实际拷贝: {result.copied_files}")
+        print(f"   去重跳过: {result.skipped_files}")
+        if result.deleted_files > 0:
+            print(f"   已删除:   {result.deleted_files}")
+        print(f"   时间: {datetime.fromtimestamp(result.created_at).strftime('%Y-%m-%d %H:%M:%S')}")
 
     @staticmethod
     def _format_size(size: int) -> str:

@@ -1,41 +1,37 @@
-"""文件扫描与增量对比模块"""
+"""文件扫描模块 - 只负责文件遍历和元数据采集
+
+变更判断逻辑已抽至 changeset.py
+"""
 
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .hashing import sha256_file
+from .changeset import FileMeta
 from .storage import FileRecord, Storage
-
-
-@dataclass
-class ScannedFile:
-    """扫描到的文件信息"""
-    abs_path: Path
-    rel_path: str
-    size: int
-    mtime: float
-    sha256: str = ""
-    md5: str = ""
-    is_new: bool = False
-    is_modified: bool = False
-    is_deleted: bool = False
-    prev_record: Optional[FileRecord] = None
 
 
 @dataclass
 class ScanResult:
     """扫描结果"""
-    files: list[ScannedFile] = field(default_factory=list)
-    total_files: int = 0
-    total_size: int = 0
-    changed_files: int = 0
-    deleted_files: int = 0
+    source_id: int
+    source_path: str
+    current_files: list[FileMeta] = field(default_factory=list)
+    previous_records: list[FileRecord] = field(default_factory=list)
+    base_dir: Path = field(default_factory=Path)
+
+    @property
+    def total_files(self) -> int:
+        return len(self.current_files)
+
+    @property
+    def total_size(self) -> int:
+        return sum(f.size for f in self.current_files)
 
 
 class FileScanner:
-    """文件扫描器"""
+    """文件扫描器 - 仅负责遍历文件系统和采集元数据"""
 
     DEFAULT_IGNORE_DIRS = {
         ".git", ".svn", ".hg", ".backup_data", "__pycache__",
@@ -61,15 +57,16 @@ class FileScanner:
     def scan_source(self, source_id: int, source_path: str,
                     snapshot_id: int,
                     ignore_dirs: Optional[set[str]] = None) -> ScanResult:
-        """扫描单个备份源，检测新增、修改、删除"""
+        """扫描单个备份源，采集当前文件元数据和上次快照记录
+
+        仅负责数据采集，变更判断由 changeset.py 处理。
+        """
         ignore = ignore_dirs if ignore_dirs is not None else self.DEFAULT_IGNORE_DIRS
         source = Path(source_path)
-        result = ScanResult()
-
-        all_files = self._iter_files(source, ignore)
         base_dir = source if source.is_dir() else source.parent
 
-        current_rel_paths: set[str] = set()
+        all_files = self._iter_files(source, ignore)
+        current_files: list[FileMeta] = []
 
         for fpath in all_files:
             try:
@@ -78,64 +75,22 @@ class FileScanner:
                 continue
 
             rel_path = str(fpath.relative_to(base_dir)) if source.is_dir() else fpath.name
-            abs_path_str = str(fpath.resolve())
-            current_rel_paths.add(rel_path)
 
-            scanned = ScannedFile(
+            current_files.append(FileMeta(
                 abs_path=fpath,
                 rel_path=rel_path,
                 size=stat.st_size,
                 mtime=stat.st_mtime,
-            )
+            ))
 
-            prev = self.storage.get_file_from_prev_snapshot(
-                source_id, rel_path, snapshot_id
-            )
-            scanned.prev_record = prev
-
-            if prev is None:
-                scanned.is_new = True
-            elif prev.is_deleted:
-                scanned.is_new = True
-            else:
-                need_hash = (
-                    prev.size != scanned.size
-                    or abs(prev.mtime - scanned.mtime) > 1e-6
-                )
-                if need_hash:
-                    scanned.is_modified = True
-                else:
-                    try:
-                        current_sha256 = sha256_file(fpath)
-                        if current_sha256 != prev.sha256:
-                            scanned.is_modified = True
-                    except (OSError, PermissionError):
-                        scanned.is_modified = True
-
-            if scanned.is_new or scanned.is_modified:
-                result.changed_files += 1
-
-            result.files.append(scanned)
-            result.total_files += 1
-            result.total_size += scanned.size
-
-        prev_snapshot_files = self.storage.get_files_from_prev_snapshot(
+        previous_records = self.storage.get_files_from_prev_snapshot(
             source_id, snapshot_id
         )
-        for prev_file in prev_snapshot_files:
-            if prev_file.rel_path not in current_rel_paths and not prev_file.is_deleted:
-                deleted = ScannedFile(
-                    abs_path=Path(prev_file.abs_path),
-                    rel_path=prev_file.rel_path,
-                    size=prev_file.size,
-                    mtime=prev_file.mtime,
-                    sha256=prev_file.sha256,
-                    md5=prev_file.md5,
-                    is_deleted=True,
-                    prev_record=prev_file,
-                )
-                result.files.append(deleted)
-                result.deleted_files += 1
-                result.changed_files += 1
 
-        return result
+        return ScanResult(
+            source_id=source_id,
+            source_path=source_path,
+            current_files=current_files,
+            previous_records=previous_records,
+            base_dir=base_dir,
+        )

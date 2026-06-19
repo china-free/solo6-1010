@@ -1,4 +1,9 @@
-"""完整性校验模块"""
+"""完整性校验模块
+
+校验分为两层：
+1. Blob 完整性校验 - 校验备份存储的 blob 文件哈希，检测备份本身是否被篡改或损坏
+2. 快照一致性校验 - 对比快照记录的文件列表与源目录当前状态，检测源目录增删改
+"""
 
 import os
 from dataclasses import dataclass, field
@@ -12,6 +17,7 @@ from .storage import FileRecord, SourceRecord, Storage
 
 @dataclass
 class VerifyResult:
+    """Blob 完整性校验结果"""
     total_files: int = 0
     passed: int = 0
     failed: int = 0
@@ -28,7 +34,8 @@ class VerifyResult:
 
 
 @dataclass
-class SourceConsistencyResult:
+class ConsistencyResult:
+    """快照一致性校验结果"""
     snapshot_active_files: int = 0
     source_current_files: int = 0
     missing_in_source: int = 0
@@ -38,7 +45,11 @@ class SourceConsistencyResult:
 
     @property
     def success(self) -> bool:
-        return self.missing_in_source == 0 and self.new_in_source == 0 and self.modified_in_source == 0
+        return (
+            self.missing_in_source == 0
+            and self.new_in_source == 0
+            and self.modified_in_source == 0
+        )
 
 
 class Verifier:
@@ -53,13 +64,18 @@ class Verifier:
         self.backup_root = Path(backup_root)
         self.storage = Storage(self.backup_root)
 
-    def verify_snapshot(
+    # ================ 第一层：Blob 完整性校验 ================
+
+    def verify_blob_integrity(
         self,
         snapshot_id: Optional[int] = None,
         algorithm: str = "sha256",
         verbose: bool = False,
     ) -> VerifyResult:
-        """校验指定快照或最新快照的 blob 完整性"""
+        """第一层：校验备份存储的 blob 完整性
+
+        验证快照记录的每个 blob 文件的哈希是否匹配，检测备份文件本身是否被篡改或损坏。
+        """
         if not self.storage.is_initialized():
             raise RuntimeError("未找到备份仓库")
 
@@ -77,10 +93,10 @@ class Verifier:
         result = VerifyResult(total_files=len(files))
 
         time_str = datetime.fromtimestamp(snap.created_at).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"🔍 开始校验快照 #{snapshot_id} ({snap.description or '无描述'})")
-        print(f"   时间: {time_str}")
-        print(f"   算法: {algorithm.upper()}")
-        print(f"   文件数: {len(files)}\n")
+        print(f"🔍 [第一层] Blob 完整性校验 - 快照 #{snapshot_id}")
+        print(f"   快照时间: {time_str}")
+        print(f"   校验算法: {algorithm.upper()}")
+        print(f"   记录文件数: {len(files)}\n")
 
         for f in files:
             if f.is_deleted:
@@ -117,15 +133,40 @@ class Verifier:
                 result.errors.append((f.rel_path, f"读取错误: {e}"))
                 print(f"  ❌ [错误] {f.rel_path}: {e}")
 
-        self._print_summary(result, snapshot_id, algorithm)
+        self._print_blob_summary(result, snapshot_id, algorithm)
         return result
 
-    def verify_source_consistency(
+    def _print_blob_summary(self, result: VerifyResult, snapshot_id: int, algorithm: str) -> None:
+        print(f"\n📊 Blob 完整性校验结果 - 快照 #{snapshot_id}:")
+        print(f"   总文件数:   {result.total_files}")
+        print(f"   通过:       {result.passed}")
+        if result.failed > 0:
+            print(f"   哈希不匹配: {result.failed}")
+        if result.missing > 0:
+            print(f"   文件丢失:   {result.missing}")
+        print()
+
+        if result.success:
+            print(f"✅ 所有 blob 文件通过 {algorithm.upper()} 完整性校验，备份完好无损！")
+        else:
+            print(f"⚠️  发现 {result.failed + result.missing} 个 blob 异常：")
+            for path, reason in result.errors[:20]:
+                print(f"   - {path}: {reason}")
+            if len(result.errors) > 20:
+                print(f"   ... 还有 {len(result.errors) - 20} 项")
+
+    # ================ 第二层：快照一致性校验 ================
+
+    def verify_snapshot_consistency(
         self,
         snapshot_id: Optional[int] = None,
         verbose: bool = False,
-    ) -> SourceConsistencyResult:
-        """校验快照文件列表与源目录当前状态的一致性"""
+    ) -> ConsistencyResult:
+        """第二层：校验快照文件列表与源目录当前状态的一致性
+
+        将快照中记录的活跃文件列表与源目录当前实际文件做对比，
+        检测出三类不一致：源目录删除了文件、源目录新增了文件、源目录修改了文件。
+        """
         if not self.storage.is_initialized():
             raise RuntimeError("未找到备份仓库")
 
@@ -140,10 +181,10 @@ class Verifier:
             raise ValueError(f"快照 #{snapshot_id} 不存在")
 
         time_str = datetime.fromtimestamp(snap.created_at).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"🔗 开始校验快照 #{snapshot_id} 与源目录的一致性")
+        print(f"🔗 [第二层] 快照一致性校验 - 快照 #{snapshot_id}")
         print(f"   快照时间: {time_str}\n")
 
-        result = SourceConsistencyResult()
+        result = ConsistencyResult()
 
         snapshot_files = self.storage.get_active_files_by_snapshot(snapshot_id)
         sources = self.storage.list_sources()
@@ -172,27 +213,16 @@ class Verifier:
 
             result.snapshot_active_files += len(snap_files_map)
 
-            source_current: set[str] = set()
-            base_dir = src_path if src_path.is_dir() else src_path.parent
-
-            if src_path.is_dir():
-                for root, dirs, filenames in os.walk(src_path):
-                    dirs[:] = [d for d in dirs if d not in self.DEFAULT_IGNORE_DIRS]
-                    for fname in filenames:
-                        fpath = Path(root) / fname
-                        rel = str(fpath.relative_to(base_dir))
-                        source_current.add(rel)
-            else:
-                if src_path.is_file():
-                    source_current.add(src_path.name)
+            source_current_files = self._scan_source_current(src_path)
+            result.source_current_files += len(source_current_files)
 
             for rel_path, snap_file in snap_files_map.items():
-                if rel_path not in source_current:
+                if rel_path not in source_current_files:
                     result.missing_in_source += 1
                     result.errors.append((rel_path, "源目录中已删除"))
                     print(f"  🗑️  [源已删除] {rel_path}")
                 else:
-                    full_path = base_dir / rel_path
+                    full_path = source_current_files[rel_path]
                     try:
                         current_sha = sha256_file(full_path)
                         if current_sha != snap_file.sha256:
@@ -207,19 +237,35 @@ class Verifier:
                         result.errors.append((rel_path, "源文件无法读取"))
                         print(f"  ⚠️  [源无法读取] {rel_path}")
 
-            for rel_path in source_current:
+            for rel_path in source_current_files:
                 if rel_path not in snap_files_map:
                     result.new_in_source += 1
                     result.errors.append((rel_path, "源目录中新增（未备份）"))
                     print(f"  📄 [源新增] {rel_path}")
 
-            result.source_current_files += len(source_current)
-
-        self._print_source_summary(result, snapshot_id)
+        self._print_consistency_summary(result, snapshot_id)
         return result
 
-    def _print_source_summary(self, result: SourceConsistencyResult, snapshot_id: int) -> None:
-        print(f"\n📊 源目录一致性校验结果 - 快照 #{snapshot_id}:")
+    def _scan_source_current(self, src_path: Path) -> dict[str, Path]:
+        """扫描源目录，获取当前所有文件的相对路径到绝对路径映射"""
+        source_current: dict[str, Path] = {}
+        base_dir = src_path if src_path.is_dir() else src_path.parent
+
+        if src_path.is_dir():
+            for root, dirs, filenames in os.walk(src_path):
+                dirs[:] = [d for d in dirs if d not in self.DEFAULT_IGNORE_DIRS]
+                for fname in filenames:
+                    fpath = Path(root) / fname
+                    rel = str(fpath.relative_to(base_dir))
+                    source_current[rel] = fpath
+        else:
+            if src_path.is_file():
+                source_current[src_path.name] = src_path
+
+        return source_current
+
+    def _print_consistency_summary(self, result: ConsistencyResult, snapshot_id: int) -> None:
+        print(f"\n📊 快照一致性校验结果 - 快照 #{snapshot_id}:")
         print(f"   快照活跃文件:   {result.snapshot_active_files}")
         print(f"   源目录当前文件: {result.source_current_files}")
         if result.missing_in_source > 0:
@@ -233,34 +279,21 @@ class Verifier:
         if result.success:
             print(f"✅ 快照文件列表与源目录当前状态完全一致！")
         else:
-            total_issues = result.missing_in_source + result.new_in_source + result.modified_in_source
+            total_issues = (
+                result.missing_in_source
+                + result.new_in_source
+                + result.modified_in_source
+            )
             print(f"⚠️  发现 {total_issues} 处不一致：")
             for path, reason in result.errors[:20]:
                 print(f"   - {path}: {reason}")
             if len(result.errors) > 20:
                 print(f"   ... 还有 {len(result.errors) - 20} 项")
 
-    def _print_summary(self, result: VerifyResult, snapshot_id: int, algorithm: str) -> None:
-        print(f"\n📊 校验结果 - 快照 #{snapshot_id}:")
-        print(f"   总文件数:   {result.total_files}")
-        print(f"   通过:       {result.passed}")
-        if result.failed > 0:
-            print(f"   哈希不匹配: {result.failed}")
-        if result.missing > 0:
-            print(f"   文件丢失:   {result.missing}")
-        print()
+    # ================ 全量校验 ================
 
-        if result.success:
-            print(f"✅ 所有文件通过 {algorithm.upper()} 完整性校验，备份完好无损！")
-        else:
-            print(f"⚠️  发现问题（{result.failed + result.missing} 个文件异常）：")
-            for path, reason in result.errors[:20]:
-                print(f"   - {path}: {reason}")
-            if len(result.errors) > 20:
-                print(f"   ... 还有 {len(result.errors) - 20} 个错误")
-
-    def verify_all(self, algorithm: str = "sha256") -> dict[int, VerifyResult]:
-        """校验所有快照"""
+    def verify_all_blobs(self, algorithm: str = "sha256") -> dict[int, VerifyResult]:
+        """校验所有快照的 blob 完整性"""
         if not self.storage.is_initialized():
             raise RuntimeError("未找到备份仓库")
 
@@ -272,7 +305,7 @@ class Verifier:
         all_ok = True
         for snap in snapshots:
             print(f"\n{'='*60}")
-            result = self.verify_snapshot(snap.id, algorithm, verbose=False)
+            result = self.verify_blob_integrity(snap.id, algorithm, verbose=False)
             results[snap.id] = result
             if not result.success:
                 all_ok = False
@@ -283,7 +316,7 @@ class Verifier:
         failed = sum(r.failed for r in results.values())
         missing = sum(r.missing for r in results.values())
 
-        print(f"📋 全量校验汇总:")
+        print(f"📋 全量 Blob 校验汇总:")
         print(f"   快照数:     {len(snapshots)}")
         print(f"   总文件数:   {total}")
         print(f"   通过:       {passed}")
@@ -297,3 +330,22 @@ class Verifier:
             print(f"\n⚠️  以下快照存在问题: {', '.join(f'#{s}' for s in bad_snaps)}")
 
         return results
+
+    # ================ 兼容接口 ================
+
+    def verify_snapshot(
+        self,
+        snapshot_id: Optional[int] = None,
+        algorithm: str = "sha256",
+        verbose: bool = False,
+    ) -> VerifyResult:
+        """兼容老接口：默认执行 blob 完整性校验"""
+        return self.verify_blob_integrity(snapshot_id, algorithm, verbose)
+
+    def verify_source_consistency(
+        self,
+        snapshot_id: Optional[int] = None,
+        verbose: bool = False,
+    ) -> ConsistencyResult:
+        """兼容老接口：执行快照一致性校验"""
+        return self.verify_snapshot_consistency(snapshot_id, verbose)

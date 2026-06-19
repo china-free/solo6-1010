@@ -77,20 +77,22 @@ def cmd_verify(args: argparse.Namespace) -> int:
     root = _find_backup_root(args.path)
     verifier = Verifier(root)
     try:
-        if args.source:
-            verifier.verify_source_consistency(
+        if args.consistency:
+            result = verifier.verify_snapshot_consistency(
                 snapshot_id=args.snapshot_id,
                 verbose=args.verbose,
             )
+            return 0 if result.success else 1
         elif args.all:
-            verifier.verify_all(algorithm=args.algorithm)
+            verifier.verify_all_blobs(algorithm=args.algorithm)
+            return 0
         else:
-            verifier.verify_snapshot(
+            result = verifier.verify_blob_integrity(
                 snapshot_id=args.snapshot_id,
                 algorithm=args.algorithm,
                 verbose=args.verbose,
             )
-        return 0
+            return 0 if result.success else 1
     except (RuntimeError, ValueError) as e:
         print(f"错误: {e}", file=sys.stderr)
         return 1
@@ -146,11 +148,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify.add_argument("snapshot_id", nargs="?", type=int, default=None, help="快照 ID（默认最新）")
     p_verify.add_argument(
         "-a", "--algorithm", choices=["md5", "sha256"],
-        default="sha256", help="校验算法（默认 sha256）",
+        default="sha256", help="Blob 校验算法（默认 sha256）",
     )
-    p_verify.add_argument("--all", action="store_true", help="校验所有快照")
-    p_verify.add_argument("-s", "--source", action="store_true",
-                          help="校验快照文件列表与源目录当前状态的一致性")
+    p_verify.add_argument("--all", action="store_true", help="校验所有快照的 Blob 完整性")
+    p_verify.add_argument("-c", "--consistency", action="store_true",
+                          help="执行第二层：快照一致性校验（对比源目录当前状态）")
     p_verify.add_argument("-v", "--verbose", action="store_true", help="显示每个文件的校验结果")
     p_verify.set_defaults(func=cmd_verify)
 
