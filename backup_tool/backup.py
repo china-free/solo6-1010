@@ -22,6 +22,7 @@ class BackupResult:
     changed_files: int
     copied_files: int
     skipped_files: int
+    deleted_files: int
 
 
 class BackupManager:
@@ -74,6 +75,7 @@ class BackupManager:
         changed_files = 0
         copied_files = 0
         skipped_files = 0
+        deleted_count = 0
 
         for src in sources:
             src_path = Path(src.path)
@@ -87,12 +89,32 @@ class BackupManager:
             total_files += scan_result.total_files
             total_size += scan_result.total_size
             changed_files += scan_result.changed_files
+            deleted_count += scan_result.deleted_files
 
             print(f"  📂 扫描 {src.path}: {scan_result.total_files} 个文件, "
-                  f"{scan_result.changed_files} 个变化")
+                  f"{scan_result.changed_files} 个变化"
+                  f"{f', {scan_result.deleted_files} 个删除' if scan_result.deleted_files else ''}")
 
             for sf in scan_result.files:
                 stored_path = ""
+
+                if sf.is_deleted:
+                    self.storage.add_file(
+                        snapshot_id=snapshot_id,
+                        source_id=src.id,
+                        rel_path=sf.rel_path,
+                        abs_path=str(sf.abs_path) if sf.abs_path.exists() else sf.prev_record.abs_path,
+                        size=sf.size,
+                        mtime=sf.mtime,
+                        md5=sf.md5,
+                        sha256=sf.sha256,
+                        stored_path=sf.prev_record.stored_path if sf.prev_record else "",
+                        is_new=False,
+                        is_modified=False,
+                        is_deleted=True,
+                    )
+                    print(f"    🗑️  [删除] {sf.rel_path}")
+                    continue
 
                 if sf.is_new or sf.is_modified:
                     try:
@@ -136,6 +158,7 @@ class BackupManager:
                         stored_path=stored_path,
                         is_new=sf.is_new,
                         is_modified=sf.is_modified,
+                        is_deleted=False,
                     )
 
         self.storage.update_snapshot_stats(
@@ -150,6 +173,7 @@ class BackupManager:
             changed_files=changed_files,
             copied_files=copied_files,
             skipped_files=skipped_files,
+            deleted_files=deleted_count,
         )
 
         print(f"\n🎉 快照 #{snapshot_id} 备份完成:")
@@ -157,6 +181,8 @@ class BackupManager:
         print(f"   变化文件: {changed_files}")
         print(f"   实际拷贝: {copied_files}")
         print(f"   去重跳过: {skipped_files}")
+        if deleted_count > 0:
+            print(f"   已删除:   {deleted_count}")
         print(f"   时间: {datetime.fromtimestamp(result.created_at).strftime('%Y-%m-%d %H:%M:%S')}")
         return result
 

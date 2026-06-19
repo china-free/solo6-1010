@@ -91,7 +91,9 @@ class HistoryManager:
         print(f"  {'-'*6} {'-'*12} {'-'*16} {'-'*40}")
 
         for f in files:
-            if f.is_new:
+            if f.is_deleted:
+                status = "[删除]"
+            elif f.is_new:
                 status = "[新增]"
             elif f.is_modified:
                 status = "[修改]"

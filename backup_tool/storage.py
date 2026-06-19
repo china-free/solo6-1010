@@ -44,6 +44,7 @@ class FileRecord:
     stored_path: str
     is_new: bool
     is_modified: bool
+    is_deleted: bool
 
 
 class Storage:
@@ -120,6 +121,7 @@ class Storage:
                 stored_path TEXT NOT NULL,
                 is_new INTEGER NOT NULL DEFAULT 0,
                 is_modified INTEGER NOT NULL DEFAULT 0,
+                is_deleted INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (snapshot_id) REFERENCES snapshots(id),
                 FOREIGN KEY (source_id) REFERENCES sources(id)
             );
@@ -211,17 +213,26 @@ class Storage:
 
     def add_file(self, snapshot_id: int, source_id: int, rel_path: str,
                  abs_path: str, size: int, mtime: float, md5: str, sha256: str,
-                 stored_path: str, is_new: bool, is_modified: bool) -> int:
+                 stored_path: str, is_new: bool, is_modified: bool,
+                 is_deleted: bool = False) -> int:
         with self._connect() as conn:
             cur = conn.execute(
                 """INSERT INTO files
                    (snapshot_id, source_id, rel_path, abs_path, size, mtime,
-                    md5, sha256, stored_path, is_new, is_modified)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    md5, sha256, stored_path, is_new, is_modified, is_deleted)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (snapshot_id, source_id, rel_path, abs_path, size, mtime,
-                 md5, sha256, stored_path, int(is_new), int(is_modified)),
+                 md5, sha256, stored_path, int(is_new), int(is_modified),
+                 int(is_deleted)),
             )
             return cur.lastrowid
+
+    def _row_to_file_record(self, row: sqlite3.Row) -> FileRecord:
+        d = dict(row)
+        d["is_new"] = bool(d.get("is_new", 0))
+        d["is_modified"] = bool(d.get("is_modified", 0))
+        d["is_deleted"] = bool(d.get("is_deleted", 0))
+        return FileRecord(**d)
 
     def get_files_by_snapshot(self, snapshot_id: int) -> list[FileRecord]:
         with self._connect() as conn:
@@ -229,26 +240,24 @@ class Storage:
                 "SELECT * FROM files WHERE snapshot_id = ? ORDER BY rel_path",
                 (snapshot_id,),
             ).fetchall()
-            records: list[FileRecord] = []
-            for r in rows:
-                d = dict(r)
-                d["is_new"] = bool(d["is_new"])
-                d["is_modified"] = bool(d["is_modified"])
-                records.append(FileRecord(**d))
-            return records
+            return [self._row_to_file_record(r) for r in rows]
+
+    def get_active_files_by_snapshot(self, snapshot_id: int) -> list[FileRecord]:
+        """获取快照中未被删除的文件"""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM files WHERE snapshot_id = ? AND is_deleted = 0 ORDER BY rel_path",
+                (snapshot_id,),
+            ).fetchall()
+            return [self._row_to_file_record(r) for r in rows]
 
     def find_file_by_sha256(self, sha256: str) -> Optional[FileRecord]:
         """按哈希查找已存储的相同文件（用于去重）"""
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM files WHERE sha256 = ? LIMIT 1", (sha256,)
+                "SELECT * FROM files WHERE sha256 = ? AND is_deleted = 0 LIMIT 1", (sha256,)
             ).fetchone()
-            if not row:
-                return None
-            d = dict(row)
-            d["is_new"] = bool(d["is_new"])
-            d["is_modified"] = bool(d["is_modified"])
-            return FileRecord(**d)
+            return self._row_to_file_record(row) if row else None
 
     def get_file_from_prev_snapshot(self, source_id: int, rel_path: str,
                                     current_snapshot_id: int) -> Optional[FileRecord]:
@@ -261,9 +270,23 @@ class Storage:
                    ORDER BY s.created_at DESC LIMIT 1""",
                 (source_id, rel_path, current_snapshot_id),
             ).fetchone()
-            if not row:
-                return None
-            d = dict(row)
-            d["is_new"] = bool(d["is_new"])
-            d["is_modified"] = bool(d["is_modified"])
-            return FileRecord(**d)
+            return self._row_to_file_record(row) if row else None
+
+    def get_files_from_prev_snapshot(self, source_id: int,
+                                     current_snapshot_id: int) -> list[FileRecord]:
+        """获取上一个快照中该备份源的所有文件（含已删除标记），用于删除检测"""
+        with self._connect() as conn:
+            latest_snap = conn.execute(
+                """SELECT s.id FROM snapshots s
+                   JOIN files f ON f.snapshot_id = s.id
+                   WHERE f.source_id = ? AND s.id < ?
+                   ORDER BY s.created_at DESC LIMIT 1""",
+                (source_id, current_snapshot_id),
+            ).fetchone()
+            if not latest_snap:
+                return []
+            rows = conn.execute(
+                "SELECT * FROM files WHERE snapshot_id = ? AND source_id = ? ORDER BY rel_path",
+                (latest_snap["id"], source_id),
+            ).fetchall()
+            return [self._row_to_file_record(r) for r in rows]

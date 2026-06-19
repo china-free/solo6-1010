@@ -77,7 +77,12 @@ def cmd_verify(args: argparse.Namespace) -> int:
     root = _find_backup_root(args.path)
     verifier = Verifier(root)
     try:
-        if args.all:
+        if args.source:
+            verifier.verify_source_consistency(
+                snapshot_id=args.snapshot_id,
+                verbose=args.verbose,
+            )
+        elif args.all:
             verifier.verify_all(algorithm=args.algorithm)
         else:
             verifier.verify_snapshot(
@@ -144,6 +149,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="sha256", help="校验算法（默认 sha256）",
     )
     p_verify.add_argument("--all", action="store_true", help="校验所有快照")
+    p_verify.add_argument("-s", "--source", action="store_true",
+                          help="校验快照文件列表与源目录当前状态的一致性")
     p_verify.add_argument("-v", "--verbose", action="store_true", help="显示每个文件的校验结果")
     p_verify.set_defaults(func=cmd_verify)
 
